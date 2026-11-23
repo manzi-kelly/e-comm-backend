@@ -1,0 +1,36 @@
+# Local environment and secrets
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Build artifacts
+/autivashop-api
+/autivashop-api.exe
+/cmd/api/api
+/cmd/api/api.exe
+/cmd/migrate/migrate
+/cmd/migrate/migrate.exe
+/dist/
+/bin/
+/build/
+/var/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage output
+/coverage.out
+/coverage.html
+*.test
+*.prof
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
