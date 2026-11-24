@@ -414,6 +414,17 @@ func (s *Service) Simulate(ctx context.Context, customerID, attemptID, outcome s
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
+	var lockedOrderID string
+	err = tx.QueryRow(ctx, `
+		SELECT o.id FROM orders o JOIN payment_attempts pa ON pa.order_id=o.id
+		WHERE pa.id=$1 FOR UPDATE OF o`, attemptID).Scan(&lockedOrderID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Attempt{}, ErrNotFound
+	}
+	if err != nil {
+		return Attempt{}, err
+	}
+
 	var owner, state, orderRef, promptStatus string
 	var amount int64
 	var orderID string
@@ -421,7 +432,7 @@ func (s *Service) Simulate(ctx context.Context, customerID, attemptID, outcome s
 		SELECT pa.order_id, pa.customer_id, pa.state, pa.prompt_status, pa.amount_rwf, o.reference
 		FROM payment_attempts pa JOIN orders o ON o.id=pa.order_id
 		WHERE pa.id=$1 FOR UPDATE OF pa`, attemptID).Scan(&orderID, &owner, &state, &promptStatus, &amount, &orderRef)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && owner != customerID) {
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (owner != customerID || orderID != lockedOrderID)) {
 		return Attempt{}, ErrNotFound
 	}
 	if err != nil {
@@ -516,8 +527,14 @@ func (s *Service) Simulate(ctx context.Context, customerID, attemptID, outcome s
 		mustJSON(result.Payload), result.OccurredAt); err != nil {
 		return Attempt{}, err
 	}
+	// Fulfillment may already have advanced under an Admin lock. Never overwrite
+	// an authoritative fulfillment state with a payment-derived legacy value.
 	if _, err := tx.Exec(ctx, `
-		UPDATE orders SET payment_status=$2, fulfillment_status=$3, updated_at=now() WHERE id=$1`,
+		UPDATE orders SET payment_status=$2,
+			fulfillment_status=CASE
+				WHEN fulfillment_status IN ('pending', 'payment_received_stock_unavailable') THEN $3
+				ELSE fulfillment_status END,
+			updated_at=now() WHERE id=$1`,
 		orderID, orderPayment, fulfillment); err != nil {
 		return Attempt{}, err
 	}
@@ -621,6 +638,16 @@ func (s *Service) consumeReservation(ctx context.Context, tx pgx.Tx, orderID str
 		}
 		if tag.RowsAffected() != 1 {
 			return false, fmt.Errorf("reservation consumption lost a locked row")
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO inventory_consumption_events
+				(order_id, product_id, reservation_id, quantity, source)
+			VALUES ($1,$2,$3,$4,'payment_simulation')`,
+			orderID, it.productID, it.reservationID, it.quantity); err != nil {
+			if isUniqueViolation(err, "inventory_consumption_events_pkey") {
+				return false, fmt.Errorf("duplicate inventory consumption record")
+			}
+			return false, err
 		}
 	}
 	return true, nil

@@ -62,7 +62,9 @@ func (l *LoginLimiter) Allow(key string) (bool, time.Duration) {
 	now := l.now()
 	state := l.getLocked(key, now)
 	if now.Before(state.blockedTo) {
-		return false, time.Until(state.blockedTo)
+		// Use the limiter's clock, not wall time: tests inject a deterministic
+		// clock and production uses time.Now, so this is correct in both cases.
+		return false, state.blockedTo.Sub(now)
 	}
 	return true, 0
 }
@@ -103,9 +105,13 @@ func (l *LoginLimiter) getLocked(key string, now time.Time) *attemptState {
 	return state
 }
 
-// For tests.
-func (l *LoginLimiter) setNow(now func() time.Time) {
+// SetNow overrides the limiter clock; it is used by activation tests to
+// exercise throttle windows deterministically.
+func (l *LoginLimiter) SetNow(now func() time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.now = now
 }
+
+// For tests in the auth package.
+func (l *LoginLimiter) setNow(now func() time.Time) { l.SetNow(now) }

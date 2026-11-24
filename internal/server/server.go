@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"autivashop/backend/internal/admin"
+	"autivashop/backend/internal/adminactivation"
+	"autivashop/backend/internal/adminreport"
 	"autivashop/backend/internal/auth"
 	"autivashop/backend/internal/config"
 	"autivashop/backend/internal/customer"
+	"autivashop/backend/internal/fulfillment"
 	"autivashop/backend/internal/middleware"
 	"autivashop/backend/internal/orders"
 	"autivashop/backend/internal/payment"
@@ -27,16 +30,19 @@ type Pinger interface {
 
 // Server owns the HTTP server and its configuration.
 type Server struct {
-	cfg             config.Config
-	db              Pinger
-	adminService    *admin.Service
-	productService  *product.Service
-	customerService *customer.Service
-	orderService    *orders.Service
-	paymentService  *payment.Service
-	logger          *slog.Logger
-	httpServer      *http.Server
-	startedAt       time.Time
+	cfg                config.Config
+	db                 Pinger
+	adminService       *admin.Service
+	activationService  *adminactivation.Service
+	adminReportService *adminreport.Service
+	productService     *product.Service
+	customerService    *customer.Service
+	orderService       *orders.Service
+	paymentService     *payment.Service
+	fulfillmentService *fulfillment.Service
+	logger             *slog.Logger
+	httpServer         *http.Server
+	startedAt          time.Time
 }
 
 // New builds a fully configured server, including its middleware chain.
@@ -69,6 +75,24 @@ func (s *Server) SetAdminService(service *admin.Service) {
 	}
 }
 
+// SetAdminActivationService enables the one-time initial administrator
+// activation routes. It never creates or enables an administrator by itself.
+func (s *Server) SetAdminActivationService(service *adminactivation.Service) {
+	s.activationService = service
+	if s.httpServer != nil {
+		s.httpServer.Handler = s.Handler()
+	}
+}
+
+// SetAdminReportService enables read-only Admin Orders and Dashboard routes.
+// It requires an Admin service to supply the session and role middleware.
+func (s *Server) SetAdminReportService(service *adminreport.Service) {
+	s.adminReportService = service
+	if s.httpServer != nil {
+		s.httpServer.Handler = s.Handler()
+	}
+}
+
 func (s *Server) SetProductService(service *product.Service) {
 	s.productService = service
 	s.httpServer.Handler = s.Handler()
@@ -93,6 +117,15 @@ func (s *Server) SetOrderService(service *orders.Service) {
 func (s *Server) SetPaymentService(service *payment.Service) {
 	s.paymentService = service
 	s.httpServer.Handler = s.Handler()
+}
+
+// SetFulfillmentService enables Phase 12 Admin mutation routes and the
+// owner-only customer fulfillment read route.
+func (s *Server) SetFulfillmentService(service *fulfillment.Service) {
+	s.fulfillmentService = service
+	if s.httpServer != nil {
+		s.httpServer.Handler = s.Handler()
+	}
 }
 
 // Handler returns the composed HTTP handler. Middleware order is:
@@ -128,6 +161,23 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/api/v1/admin/auth/session-check", middleware.MethodNotAllowed)
 	}
 
+	// The activation surface is available even if the admin service has not
+	// been registered yet; its handlers fail closed when the service is nil.
+	if s.adminService != nil || s.activationService != nil {
+		ah := &activationHandlers{
+			svc:     s.activationService,
+			cfg:     s.cfg,
+			cookies: auth.NewCookieConfig(s.cfg.Auth),
+			logger:  s.logger,
+		}
+		mux.HandleFunc("POST /api/v1/admin/activation/request-code", ah.requestCode)
+		mux.HandleFunc("/api/v1/admin/activation/request-code", middleware.MethodNotAllowed)
+		mux.HandleFunc("POST /api/v1/admin/activation/verify-code", ah.verifyCode)
+		mux.HandleFunc("/api/v1/admin/activation/verify-code", middleware.MethodNotAllowed)
+		mux.HandleFunc("POST /api/v1/admin/activation/complete", ah.complete)
+		mux.HandleFunc("/api/v1/admin/activation/complete", middleware.MethodNotAllowed)
+	}
+
 	if s.customerService != nil {
 		s.registerCustomerAuth(mux)
 	}
@@ -136,6 +186,12 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.paymentService != nil {
 		s.registerPayments(mux)
+	}
+	if s.customerService != nil && s.fulfillmentService != nil {
+		s.registerCustomerFulfillment(mux)
+	}
+	if s.adminService != nil && s.fulfillmentService != nil {
+		s.registerAdminFulfillment(mux)
 	}
 
 	s.registerProducts(mux)

@@ -16,14 +16,19 @@ import (
 	"syscall"
 
 	"autivashop/backend/internal/admin"
+	"autivashop/backend/internal/adminactivation"
+	"autivashop/backend/internal/adminreport"
 	"autivashop/backend/internal/auth"
 	"autivashop/backend/internal/config"
 	"autivashop/backend/internal/customer"
 	"autivashop/backend/internal/database"
+	"autivashop/backend/internal/fulfillment"
 	"autivashop/backend/internal/orders"
 	"autivashop/backend/internal/payment"
 	"autivashop/backend/internal/product"
 	"autivashop/backend/internal/server"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -33,10 +38,12 @@ func main() {
 			runMigrate()
 		case "bootstrap-admin":
 			runBootstrapAdmin()
+		case "provision-admin-activation":
+			runProvisionAdminActivation()
 		case "cleanup-product-images":
 			runImageCleanup()
 		default:
-			fmt.Fprintln(os.Stderr, "unknown command; expected 'migrate', 'bootstrap-admin', 'cleanup-product-images', or no argument")
+			fmt.Fprintln(os.Stderr, "unknown command; expected 'migrate', 'bootstrap-admin', 'provision-admin-activation', 'cleanup-product-images', or no argument")
 			os.Exit(2)
 		}
 		return
@@ -60,18 +67,29 @@ func runServer() {
 	// database is available on a subsequent process start.
 	var pinger server.Pinger
 	var adminSvc *admin.Service
+	var activationSvc *adminactivation.Service
+	var adminReportSvc *adminreport.Service
 	var productSvc *product.Service
 	var customerSvc *customer.Service
 	var orderSvc *orders.Service
 	var paymentSvc *payment.Service
+	var fulfillmentSvc *fulfillment.Service
 	if db, err := database.New(ctx, cfg.Database); err != nil {
 		logger.Error("database unavailable at startup; readiness will report 503")
 	} else {
 		defer db.Close()
 		pinger = db
 		adminSvc = admin.NewService(db.Pool(), cfg, logger)
+		activationSvc, err = newActivationService(db.Pool(), cfg, logger)
+		if err != nil {
+			// Activation endpoints stay registered but fail closed with 503;
+			// e-commerce, payments and fulfillment remain unaffected.
+			logger.Error("admin activation disabled", "reason", err.Error())
+		}
+		adminReportSvc = adminreport.NewService(db.Pool())
 		customerSvc = customer.NewService(db.Pool(), cfg, logger)
 		orderSvc = orders.NewService(db.Pool(), cfg)
+		fulfillmentSvc = fulfillment.NewService(db.Pool(), cfg)
 		if provider, providerErr := newPaymentProvider(cfg); providerErr != nil {
 			logger.Error("payment provider unavailable; payment routes disabled")
 		} else if svc, serviceErr := payment.NewService(db.Pool(), provider, cfg); serviceErr != nil {
@@ -99,6 +117,10 @@ func runServer() {
 	if adminSvc != nil {
 		srv.SetAdminService(adminSvc)
 	}
+	srv.SetAdminActivationService(activationSvc)
+	if adminReportSvc != nil {
+		srv.SetAdminReportService(adminReportSvc)
+	}
 	if productSvc != nil {
 		srv.SetProductService(productSvc)
 	}
@@ -110,6 +132,9 @@ func runServer() {
 	}
 	if paymentSvc != nil {
 		srv.SetPaymentService(paymentSvc)
+	}
+	if fulfillmentSvc != nil {
+		srv.SetFulfillmentService(fulfillmentSvc)
 	}
 
 	logger.Info("api starting", "address", cfg.Addr(), "environment", cfg.Environment)
@@ -168,6 +193,91 @@ func runMigrate() {
 		os.Exit(1)
 	}
 	logger.Info("migrations complete", "applied", applied)
+}
+
+// newActivationService requires complete SMTP/HMAC configuration. Missing
+// configuration disables activation instead of fabricated delivery success.
+func newActivationService(pool *pgxpool.Pool, cfg config.Config, logger *slog.Logger) (*adminactivation.Service, error) {
+	ac := cfg.AdminActivation
+	if !ac.Enabled {
+		issues := strings.Join(ac.SetupIssues, ", ")
+		if issues == "" {
+			issues = "activation email delivery is not configured"
+		}
+		return nil, fmt.Errorf("required setup: %s", issues)
+	}
+	sender, err := adminactivation.NewSMTPSender(ac.SMTPHost, ac.SMTPPort, ac.SMTPUsername,
+		ac.SMTPPassword, ac.SMTPFrom, ac.SMTPTLSMode, ac.SMTPTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return adminactivation.NewService(pool, ac, sender.WithLogger(logger), logger)
+}
+
+// runProvisionAdminActivation is an explicit development/test database setup
+// operation. It provisions only the compiled-in authorized email and creates
+// no administrator account, password or session.
+func runProvisionAdminActivation() {
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "invalid configuration")
+		os.Exit(1)
+	}
+	if cfg.IsProduction() {
+		fmt.Fprintln(os.Stderr, "activation setup is refused in production")
+		os.Exit(1)
+	}
+	if !cfg.AdminActivation.SetupAllowed {
+		fmt.Fprintln(os.Stderr, "activation setup is not authorized: set AUTIVASHOP_ALLOW_ACTIVATION_SETUP=true in an explicitly controlled development/test environment")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	db, err := database.New(ctx, cfg.Database)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "database connection failed")
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	versions, err := db.AppliedVersions(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "could not inspect applied migrations")
+		os.Exit(1)
+	}
+	hasActivationSchema := false
+	for _, version := range versions {
+		if version == "0007_admin_activation.sql" {
+			hasActivationSchema = true
+			break
+		}
+	}
+	if !hasActivationSchema {
+		fmt.Fprintln(os.Stderr, "activation schema is missing: run 'migrate' first")
+		os.Exit(1)
+	}
+
+	displayName := strings.TrimSpace(os.Getenv("ADMIN_ACTIVATION_DISPLAY_NAME"))
+	if displayName == "" {
+		displayName = "AutivaShop Administrator"
+	}
+	created, err := adminactivation.NewProvisioner(db.Pool(), newLogger(cfg)).Provision(ctx, displayName)
+	if err != nil {
+		switch {
+		case errors.Is(err, adminactivation.ErrAdminExists):
+			fmt.Fprintln(os.Stderr, "activation setup refused: administrator accounts already exist; existing accounts were left untouched")
+		case errors.Is(err, adminactivation.ErrAlreadyActivated):
+			fmt.Fprintln(os.Stderr, "activation setup refused: initial administrator activation is already complete")
+		default:
+			fmt.Fprintln(os.Stderr, "activation setup failed")
+		}
+		os.Exit(1)
+	}
+	if created {
+		fmt.Fprintln(os.Stdout, "authorized administrator email provisioned; no administrator account was created")
+		return
+	}
+	fmt.Fprintln(os.Stdout, "authorized administrator email was already provisioned; no changes made")
 }
 
 func runBootstrapAdmin() {

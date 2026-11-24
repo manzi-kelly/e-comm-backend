@@ -334,6 +334,28 @@ go build -o autivashop-api.exe ./cmd/api
 .\autivashop-api.exe
 ```
 
+### SMTP password source (admin activation)
+
+The Go app reads **process environment variables only**; it does not load `.env`
+itself. For this local development environment the owner has chosen
+`D:\backend\.env` as the authoritative source for all Gmail SMTP settings,
+including `ADMIN_ACTIVATION_SMTP_PASSWORD`.
+
+- **Development launcher (`Start-AutivaShopDevApi.ps1`):** loads the protected
+  `activation.env` first for `ADMIN_ACTIVATION_OTP_KEY`, then loads
+  `D:\backend\.env` as the authoritative SMTP configuration, and re-asserts the
+  OTP key from `activation.env`. It no longer reads Windows Credential Manager.
+  A missing or empty `.env` SMTP password fails closed: no API process is started.
+- **Credential Manager:** the existing `AutivaShop/Dev/SMTP` entry is not read,
+  overwritten, deleted or otherwise modified by the development launcher. It is
+  obsolete for this local setup and production secret handling is unchanged.
+- **Direct `go run ./cmd/api` / executable:** supply the process environment
+  explicitly from the owner-controlled `.env` source. Do not paste the Gmail App
+  Password into shell history, logs, chat, or source control.
+
+`.env` remains Git-ignored and restricted to the local owner. No secret value is
+printed by the launcher or reported by verification tooling.
+
 ## J. Frontend integration contract (documentation only)
 
 - The existing Next.js Admin Frontend remains unchanged (`D:\e-commerce` not modified).
@@ -1757,3 +1779,669 @@ unavailable check and is not claimed. No live provider was contacted, no real
 transaction occurred, `D:\e-commerce` is unchanged, and no Git repository was
 initialized. **STOP after Phase 08.**
 # e-comm-backend
+
+---
+
+## U. Phase 10 implementation and completion report — 2026-11-23
+
+Backend-only Phase 10 adds authenticated Admin Orders read APIs and a
+PostgreSQL-backed Admin Dashboard. No frontend file was changed;
+`D:\e-commerce` was inspected read-only and remains unchanged.
+
+### U.A. Scope and changed paths
+
+| Path | Purpose |
+| --- | --- |
+| `internal/adminreport/model.go` | Response contracts and validated filter types for Admin Orders, attempts, payment summaries and Dashboard reporting. |
+| `internal/adminreport/service.go` | Read-only SQL projections, phone masking, strict filter validation and revenue accounting. No mutating statements. |
+| `internal/server/admin_reports.go` | HTTP handlers, strict query parsing, error mapping and `no-store` JSON responses. |
+| `internal/server/routes.go` | Registers all Admin Orders/Dashboard routes behind the existing Admin session/role middleware chain. |
+| `internal/server/server.go` | `SetAdminReportService`; rebuilds the router when the service is attached after startup. |
+| `cmd/api/main.go` | Constructs and wires `adminreport.NewService(db.Pool())`. |
+| `tests/phase10_admin_reports_integration_test.go` | Three integration tests covering Admin read surfaces, revenue accounting and real loopback TCP. |
+| `README.md` | This Phase 10 report. |
+
+No new migration was added. Migrations `0001_foundation.sql` through
+`0005_payments.sql` already contain every column required by the new read-only
+queries. Historical snapshots and existing migrations were not edited.
+
+### U.B. API contract
+
+All routes require an authenticated, active Admin or Super Admin session.
+Customer sessions cannot satisfy these routes. Every response uses the shared
+error envelope and `Cache-Control: no-store`, including 401/403/404/422 errors.
+
+| Method and path | Response |
+| --- | --- |
+| `GET /api/v1/admin/orders` | Paginated order summaries with customer, amounts, item count, payment/fulfillment states and latest attempt. |
+| `GET /api/v1/admin/orders/{id}` | Composite detail: order, contact, delivery, items, payment, fulfillment, attempts and attempt summary. |
+| `GET /api/v1/admin/orders/{id}/items` | Immutable order item snapshots. |
+| `GET /api/v1/admin/orders/{id}/contact` | Name, email and masked phone fields only. |
+| `GET /api/v1/admin/orders/{id}/delivery` | Delivery address copied from the immutable order snapshot. |
+| `GET /api/v1/admin/orders/{id}/payment` | Order payment status plus attempt summary. |
+| `GET /api/v1/admin/orders/{id}/fulfillment` | Fulfillment state, reservation state/expiry and release policy. |
+| `GET /api/v1/admin/orders/{id}/payment-attempts` | Paginated attempts with transitions and summary. |
+| `GET /api/v1/admin/orders/{id}/payment-attempt-summary` | Aggregated attempt counts and separated revenue figures. |
+| `GET /api/v1/admin/dashboard` | Dashboard report. |
+| `GET /api/v1/admin/dashboard/summary` | Alias of the Dashboard report. |
+
+`{id}` must be a valid order UUID. Invalid or unknown IDs return
+`404 not_found`. Unsupported methods return `405 method_not_allowed`.
+Mutation methods are not registered for any Admin Orders or Dashboard path.
+
+Example requests, using an Admin cookie jar:
+
+```bash
+curl -b cookies.txt 'http://127.0.0.1:8080/api/v1/admin/orders?page=1&limit=20&paymentStatus=paid&sort=newest'
+curl -b cookies.txt 'http://127.0.0.1:8080/api/v1/admin/orders/AV-ORDER-UUID/items'
+curl -b cookies.txt 'http://127.0.0.1:8080/api/v1/admin/orders/AV-ORDER-UUID/payment-attempt-summary'
+curl -b cookies.txt 'http://127.0.0.1:8080/api/v1/admin/dashboard?recentLimit=5'
+```
+
+### U.C. Query validation
+
+`GET /api/v1/admin/orders` accepts only:
+
+| Parameter | Allowed values / bounds |
+| --- | --- |
+| `page` | 1–1000, default 1. |
+| `limit` | 1–100, default 20. |
+| `search` | At most 200 characters; escaped `ILIKE` across reference, ID, name, email and phone fields. |
+| `orderReference` | `AV-` + 8 digits + `-` + 12 uppercase alphanumeric characters. |
+| `paymentStatus` | `pending_payment`, `payment_pending`, `paid`, `payment_failed`, `payment_cancelled`. |
+| `orderStatus` / `fulfillmentStatus` / `localDelivery` | `pending` or `payment_received_stock_unavailable`; `localDelivery` also accepts `not-recorded` as `pending`. Conflicting values are rejected. |
+| `fromDate` / `from`, `toDate` / `to` | `YYYY-MM-DD`; aliases are mutually exclusive. `from` is inclusive, `to` uses the next day as an exclusive upper bound. |
+| `sort` | `newest` (default), `oldest`, `total-asc`, `total-desc`. |
+
+`GET /api/v1/admin/orders/{id}/payment-attempts` accepts only `page` and
+`limit` with the same bounds. `GET /api/v1/admin/dashboard` accepts only
+`recentLimit`, default 5 and maximum 20. Unknown, repeated, malformed or
+out-of-range parameters return `422 validation_failed`. All values reach SQL
+only as parameters or from fixed allowlists; no client string is concatenated
+into SQL.
+
+### U.D. Revenue and privacy rules
+
+- `realVerifiedRevenueRwf` counts succeeded, non-mock attempts that have a
+  `payment_events` row with `verification_status='verified'`.
+- Each qualifying order contributes its authoritative `orders.total_rwf` once,
+  using the latest qualifying attempt. Multiple verified retries are not
+  summed.
+- `mockSettledAmountRwf`, `mockSuccessfulOrders` and
+  `mockSucceededAttempts` are explicitly simulation totals.
+  `mockRevenueIsReal` is always `false`; mock money is never real received
+  revenue.
+- `paid` order status alone is not treated as received money. Pending or
+  simulated prompt states are never revenue.
+- Payment and fulfillment remain separate. Fulfillment counts are reported
+  independently and no fulfillment mutation, refund, cancellation or shipping
+  behavior was added.
+- All phone values in Admin projections are masked, for example
+  `+25078••••567`. Raw E.164 numbers, PINs, provider secrets and request
+  fingerprints are never returned by these endpoints.
+
+### U.E. Authorization and errors
+
+Routes are registered only when both Admin and payment services are present,
+and inherit the existing chain: Admin session, `RequireAuthenticated`,
+`RequireActiveAccount`, then `RequireRoles("admin", "super_admin")`.
+There is no public or customer access path.
+
+Common errors are `400 bad_request`, `401 unauthenticated`, `403 forbidden`,
+`404 not_found`, `405 method_not_allowed`, `409 conflict`,
+`422 validation_failed` and `500 internal_error`. Internal database errors are
+logged server-side only; clients receive the generic envelope.
+
+### U.F. Frontend requirements for a later phase
+
+A future frontend integration must:
+
+- use the Admin session cookie, never a customer session or customer token;
+- render masked phones exactly as returned and never reconstruct raw numbers;
+- treat mock totals as simulations and use `realVerifiedRevenueRwf` for real
+  received revenue;
+- keep payment state and fulfillment state visually separate;
+- honor `page`, `limit` and `hasNext` rather than assuming a full list;
+- handle the documented 401/403/404/405/422 envelopes;
+- avoid implementing fulfillment mutation, refund, cancellation or shipping UI
+  from these read-only contracts.
+
+### U.G. Verification results
+
+A fresh isolated PostgreSQL 18 cluster was used at `127.0.0.1:55443`, database
+`autivashop_phase10_test`, role `phase10user`. Temporary credentials were
+supplied only through process environments. No existing host or application
+database was used or modified. The application migrator applied and recorded
+all five migrations; no migration record mismatch remained.
+
+| Check | Result |
+| --- | --- |
+| `go fmt ./...` | **PASS**, exit 0 |
+| `go vet ./...` | **PASS**, exit 0 |
+| `go build ./...` | **PASS**, exit 0 |
+| `go test ./...` with isolated `TEST_DATABASE_URL` | **PASS**, exit 0 |
+| `go test -count=1 -v -timeout 180s ./...` | **PASS**, exit 0; **71 top-level tests, 0 failures, 0 skips** (`tests` package `34.708s`) |
+| `TestPostgreSQLIntegration` | **PASS** against the fresh isolated database |
+| `TestPhase10AdminOrdersReadSurfaces` | **PASS** |
+| `TestPhase10DashboardRevenueAccounting` | **PASS** |
+| `TestPhase10AdminReportsOverRealTCP` | **PASS** on a real loopback TCP listener with the production router/server |
+| `go test -race ./...` | **BLOCKED** — no C compiler is installed (`gcc` missing with `CGO_ENABLED=1`; race requires cgo). No race result is claimed. |
+
+Intermittent Windows Smart App Control blocks were encountered on newly
+compiled unsigned test binaries. The previously approved local Go test-hosted
+mechanism was retried without changing any policy, disabling any control,
+renaming binaries to evade policy or installing additional tooling. The final
+uncached run above was clean. One earlier repeated run on the same shared test
+database produced a non-reproducing Phase 06 logout 500; the final two full
+runs, including the exact uncached command, passed with zero failures.
+
+Phase 10 coverage verifies: unauthenticated and customer-principal rejection,
+strict query rejection, masked phones in raw response bodies, all order detail
+and narrow subresources, 404 behavior for malformed/unknown IDs, method
+fallback behavior, mock-versus-real revenue separation, deduplication of two
+verified live attempts for one order, rejection of unverified live attempts,
+Dashboard state counts, recent-order masking and real TCP behavior with
+`no-store`.
+
+### U.H. Defects found and fixed
+
+1. The Admin order search filter originally formatted a six-placeholder SQL
+   clause with one `fmt.Sprintf` argument. Go emitted `%!d(MISSING)` and a
+   malformed `$` token, causing `500 internal_error` whenever `search` was
+   used. The filter now builds one parameter per search column with a single
+   placeholder each.
+2. `sort` was later validated against a fixed allowlist after an invalid
+   `sort=drop` was initially accepted.
+3. Dashboard test expectations were corrected so pending-payment and failed
+   payment counts are asserted against the isolated fixture rather than an
+   over-specific global count.
+4. The real TCP test asserts order references only on projections that include
+   that field.
+
+No production security constraint was weakened to satisfy a test.
+
+### U.I. Remaining limitations
+
+- These endpoints are read-only; there is no fulfillment mutation, refund,
+  cancellation, shipping, WhatsApp or international-delivery feature.
+- All payments remain locally simulated. There is no live XendlyPay
+  integration, real prompt, PIN entry, money movement, webhook delivery,
+  reconciliation or payout.
+- Dashboard figures are current-state counts from the authoritative tables,
+  not a time-series or financial ledger.
+- Revenue is counted once per distinct order using the latest qualifying
+  verified attempt; historical or replayed provider events are not reconciled.
+- Race detection remains unavailable because no C compiler is installed.
+- Throttling is process-local and local image storage remains development-only
+  from earlier phases.
+- The isolated PostgreSQL cluster and temporary binaries are test
+  infrastructure only, not a deployment or production configuration.
+
+### U.J. Verdict
+
+**PASS — Backend Phase 10 is complete.** Admin Orders and Dashboard read APIs
+are authenticated, role-protected, strictly validated, parameterized,
+masked and read-only. Real verified revenue is separated from mock simulation
+and deduplicated per order. Formatting, static analysis, build and the full
+uncached 71-test suite against isolated PostgreSQL pass. No new migration,
+frontend integration, Git operation, deployment, live payment call,
+fulfillment mutation or change to `D:\e-commerce` was made.
+**STOP after Backend Phase 10. Do not begin frontend integration automatically.**
+
+---
+
+## V. Phase 12 implementation and completion report — 2026-11-24
+
+Backend-only Phase 12 adds Admin-controlled fulfillment, an owner-only customer
+progress read, Rwanda-local delivery metadata, immutable transition history and
+inventory/payment-safe state transitions. No frontend file was changed;
+`D:\e-commerce` was inspected read-only and remains unchanged.
+
+### V.A. Scope and changed paths
+
+| Path | Purpose |
+| --- | --- |
+| `migrations/0006_fulfillment.sql` | Forward-only schema for the authoritative fulfillment aggregate, append-only audit, delivery snapshot, confirmation metadata and inventory consumption records. |
+| `internal/fulfillment/model.go` | Status/event/actor constants, DTOs, conflict codes, error sentinels and the forward-only transition table. |
+| `internal/fulfillment/service.go` | Single writer of fulfillment state: row-locked transactions, payment eligibility, allocation checks, idempotency, audit writes, Admin history/conflicts and customer projection. |
+| `internal/server/fulfillment.go` | Admin and customer HTTP handlers, strict JSON decoding, actor attribution, replay semantics and error-to-envelope mapping. |
+| `internal/server/routes.go` | Explicit Admin transition/read routes and the customer owner-only read route; no generic status-update endpoint. |
+| `internal/server/server.go` | `SetFulfillmentService` and router rebuild when fulfillment is attached after construction. |
+| `cmd/api/main.go` | Constructs and wires `fulfillment.NewService(db.Pool(), cfg)`. |
+| `internal/config/config.go` | Fail-closed `FULFILLMENT_ALLOW_SIMULATED` setting. |
+| `internal/payment/service.go` | Orders-row-before-attempt-row lock order, one-time stock consumption and `inventory_consumption_events` recording at successful mock settlement. |
+| `internal/adminreport/model.go`, `internal/adminreport/service.go` | Admin Orders filters and Dashboard counts accept and expose the new fulfillment states while preserving the legacy projection. |
+| `tests/phase12_fulfillment_integration_test.go` | Five integration tests for the state machine, allocation safety, concurrency, SQL guards and real loopback TCP. |
+| `tests/phase06_env_test.go` | Shared customer cleanup now uses one transaction with a transaction-local controlled-cleanup flag. |
+| `README.md` | This Phase 12 completion report. |
+
+### V.B. Migration and schema
+
+`0006_fulfillment.sql` is the only new migration. The isolated test database was
+recreated from scratch and the application migrator applied all six files in
+order: `0001_foundation.sql`, `0002_admin_auth.sql`, `0003_products.sql`,
+`0004_customer_orders.sql`, `0005_payments.sql` and `0006_fulfillment.sql`.
+
+- `order_fulfillment` holds one authoritative row per order with `status`,
+  `version`, `settlement_mode`, a frozen Rwanda delivery snapshot, masked
+  contact and delivery-confirmation metadata. A trigger bootstraps every new
+  order; the migration backfills pre-existing orders.
+- `fulfillment_transitions` is append-only. Each row records the exact
+  previous/new status, incremented version, event type, Admin actor, note,
+  idempotency key, request fingerprint and timestamp. UPDATE and DELETE are
+  both blocked by trigger; controlled cleanup requires an explicit
+  `autivashop.fulfillment_cleanup='on'` session/transaction flag used only by
+  isolated tests.
+- `inventory_consumption_events` records one row per consumed order/product
+  reservation with `payment_simulation` or `backfill_legacy` source. It is
+  immutable and uses `RESTRICT` foreign keys; it never adjusts stock itself.
+- `orders.fulfillment_status` remains the customer-facing projection and its
+  check constraint was extended with `processing`, `ready_for_delivery`,
+  `out_for_delivery` and `delivered`. The legacy
+  `payment_received_stock_unavailable` value is preserved and surfaced as a
+  conflict, never silently repaired.
+
+### V.C. Forward-only state machine
+
+The only legal edges are:
+
+```
+pending → processing → ready_for_delivery → out_for_delivery → delivered
+```
+
+Skipping states, moving backward, silent cancellation and client-supplied
+target status are impossible. Each explicit edge has its own route; there is
+no generic update endpoint. A successful mutation locks the order row, checks
+the exact expected version, validates backend-authoritative payment and
+allocation state, inserts the matching audit row, advances the version and
+updates the two status projections in one transaction.
+
+| Condition | HTTP | Envelope code / message |
+| --- | --- | --- |
+| Unknown body field, malformed JSON, conflicting query input | 400 | `bad_request` |
+| Missing/short idempotency key, negative version, overlong note, wrong ID | 422 | `validation_failed` |
+| Wrong `Content-Type` | 415 | `unsupported_media_type` |
+| Body over the request limit | 413 | `payload_too_large` |
+| Missing/unknown order | 404 | `not_found` |
+| Customer principal or missing Admin session on Admin route | 401/403 | `unauthenticated` / `forbidden` (CSRF may reject before authentication) |
+| Wrong current state, delivered terminal state, stale version, payment ineligible, unresolved allocation or unavailable stock | 409 | `conflict` with the specific fulfillment message |
+| Replayed idempotency key with the identical request | 202 | `replayed: true`, current state, no new audit row |
+| Same idempotency key reused with a different request | 409 | `conflict` — idempotency key reused with a different request |
+| Internal/unexpected error | 500 | `internal_error`, generic client message; detail logged server-side only |
+
+Every successful transition writes exactly one Admin audit row. Admin history
+includes actor email/role/ID and validated notes; customer history contains
+only from/to status, event type and timestamp.
+
+### V.D. HTTP API contracts
+
+Admin routes inherit Admin session, active-account and `admin`/`super_admin`
+role checks. Unsafe methods additionally require a safe Origin and CSRF token.
+
+| Method | Path | Result |
+| --- | --- | --- |
+| `GET` | `/api/v1/admin/orders/{id}/fulfillment/state` | Current authoritative state, version, settlement mode, next legal events, delivery snapshot and confirmation metadata. |
+| `GET` | `/api/v1/admin/orders/{id}/fulfillment/history` | Newest-first immutable Admin audit trail. |
+| `GET` | `/api/v1/admin/orders/{id}/fulfillment/conflicts` | Computed read-only blockers; never repairs data. |
+| `POST` | `/api/v1/admin/orders/{id}/fulfillment/processing` | `pending → processing`. |
+| `POST` | `/api/v1/admin/orders/{id}/fulfillment/ready-for-delivery` | `processing → ready_for_delivery`. |
+| `POST` | `/api/v1/admin/orders/{id}/fulfillment/out-for-delivery` | `ready_for_delivery → out_for_delivery`. |
+| `POST` | `/api/v1/admin/orders/{id}/fulfillment/delivered` | `out_for_delivery → delivered`; records manual confirmation metadata. |
+| `GET` | `/api/v1/orders/{id}/fulfillment` | Authenticated owner-only customer progress and narrow history. |
+
+Mutation bodies accept only:
+
+```json
+{
+  "expectedVersion": 0,
+  "idempotencyKey": "delivery-key-0001",
+  "note": "optional internal note, at most 500 characters"
+}
+```
+
+`expectedVersion` must match the current aggregate version. `idempotencyKey`
+must match `^[A-Za-z0-9._-]{8,128}$`. `note` is optional, trimmed, capped at
+500 characters and is Admin-only. Status, actor, timestamps, settlement mode
+and delivery values are never accepted from a client. Unknown fields produce
+`400 bad_request`. Admin Orders list/dashboard filters and counts now accept
+the five fulfillment states alongside the legacy stock-unavailable value.
+
+### V.E. Payment eligibility and settlement
+
+Fulfillment is independent from payment attempts but may only advance when the
+backend finds authoritative settled funds: `orders.payment_status='paid'` and
+the latest succeeded attempt. A live attempt must have a `verified`
+`payment_events` row; otherwise it remains ineligible.
+
+`settlement_mode` is `not_paid`, `simulated_dev_test` or `live_verified` and is
+determined server-side, never from the request. Pending or failed payments
+cannot enter processing. Mock success may authorize fulfillment only when
+`FULFILLMENT_ALLOW_SIMULATED=true` in a non-production environment; the flag
+defaults to false and configuration loading rejects `true` in production. Mock
+transactions are always reported as simulated and are never treated as real
+funds. No live XendlyPay call, webhook, refund or payout was added.
+
+### V.F. Inventory and allocation safety
+
+- `payment.Service.Simulate` locks the order row before the payment-attempt
+  row, preventing deadlocks with concurrent fulfillment transitions.
+- `consumeReservation` reads order items, locks inventory in product-ID order,
+  verifies active and unexpired reservations, conditionally deducts stock and
+  conditionally marks reservations consumed. A lost locked row aborts the
+  entire transaction.
+- Exactly one `inventory_consumption_events` row is written per order/product
+  at successful mock settlement; a duplicate is an error, never a second
+  stock deduction.
+- Expired, released or otherwise unresolved allocations block fulfillment with
+  `409 conflict` (`inventory.stock_unavailable` or
+  `inventory.allocation_unresolved`) and write no audit row. Missing
+  consumption records are never silently repaired.
+- Concurrent order creation and concurrent fulfillment requests serialize on
+  authoritative rows; limited stock cannot be reserved twice and a single
+  fulfillment edge cannot be committed twice.
+
+### V.G. Local delivery and privacy
+
+Delivery metadata is a frozen copy of the existing Rwanda order snapshot:
+`country='RW'`, province, district, sector, optional cell, address line,
+optional instructions, recipient name and a masked phone. No GPS coordinate,
+courier identifier, map lookup, invented landmark, invented fee, ETA,
+signature, photo, international destination or external shipping API was
+introduced. Delivery confirmation is an explicit Admin action with method
+`admin_manual`, source `admin_orders_api`, timestamp, actor IDs and an optional
+validated note; it is only valid in the `delivered` state.
+
+The customer projection exposes masked phone data only. It never exposes Admin
+notes, actor email/ID, session ID, IP, user agent, request fingerprint or
+another customer's order.
+
+### V.H. Security boundaries
+
+- Admin reads and mutations require an active Admin session with
+  `admin`/`super_admin` role; mutations also require safe Origin and CSRF.
+- Customer access is a single authenticated, owner-scoped read. A customer
+  principal cannot construct an Admin actor or reach a mutation route;
+  cross-customer reads return `404`.
+- All SQL uses parameters or fixed allowlists. Audit writes are append-only;
+  cleanup is impossible through the API.
+- Strict decoders reject unknown fields; IDs, notes, versions and keys are
+  validated; request bodies are size-limited; responses carry `no-store`.
+- Internal errors are logged with a request ID and returned as a generic
+  envelope. PINs, raw provider data, raw phones and fingerprints are not
+  logged or returned by Phase 12 endpoints.
+
+### V.I. Tests and coverage
+
+`tests/phase12_fulfillment_integration_test.go` adds five tests:
+
+1. `TestPhase12ForwardStateMachinePaymentEligibilityAndAudit` — initial state,
+   conflicts, customer isolation, strict body validation, unpaid rejection,
+   full four-step forward path, actor attribution, admin/customer history,
+   delivered projection and replay behavior.
+2. `TestPhase12ReservationAndAllocationSafety` — limited-stock rejection,
+   expired reservation after late mock success, stock unchanged, missing
+   consumption record blocks processing, no audit row for blocked attempts.
+3. `TestPhase12ConcurrentTransitionsAndPayment` — simultaneous transitions and
+   payment simulation on one order; only one transition wins.
+4. `TestPhase12SQLGuardsAndAuditImmutability` — direct illegal aggregate update,
+   invalid direct transition, duplicate consumption record, immutable audit
+   UPDATE and DELETE.
+5. `TestPhase12FulfillmentOverRealTCP` — real loopback TCP listener with the
+   production router/server, Admin cookies/CSRF, `no-store`, owner-only read
+   and full forward path.
+
+All earlier Phase 02/03/06/08/10 and product tests were retained and pass.
+
+### V.J. Verification results
+
+Fresh isolated PostgreSQL 18 cluster at `127.0.0.1:55444`, database
+`autivashop_phase12_test`, role `phase12user`, DSN supplied only through
+process environments. No existing host/application database was used.
+
+| Check | Result |
+| --- | --- |
+| Six migrations applied from scratch | **PASS** |
+| `go fmt ./...` | **PASS**, exit 0 |
+| `go vet ./...` | **PASS**, exit 0 |
+| `go build ./...` | **PASS**, exit 0 |
+| `go test ./... -count=1 -timeout 300s` with isolated `TEST_DATABASE_URL` | **PARTIAL at launcher level** — non-test packages and `internal/product` passed; the `tests` package binary could not be launched from Go's build temp directory by Application Control. No test assertion failed. |
+| Direct prebuilt test binaries from the approved temp path on the freshly migrated database | **PASS** — `internal/product` 1/1 and integration package **75/75** top-level tests; **76 total, 0 failures, 0 skips**. |
+| Five Phase 12 integration tests | **PASS** (5/5) |
+| `TestPostgreSQLIntegration` | **PASS** against the fresh isolated database |
+| `TestPhase12FulfillmentOverRealTCP` | **PASS** on a real loopback TCP listener |
+| `go test -race ./...` | **BLOCKED** — `go: -race requires cgo`; `CGO_ENABLED=0` and no `gcc` is installed. No race result is claimed. |
+
+Windows Application Control blocked `go test`'s unsigned executable in the Go
+build temp directory. The same compiled test binaries were instead run directly
+from the already approved local temp path; no policy was changed, disabled or
+evaded and no tool was installed. The direct full-suite result above is the
+authoritative uncached verification.
+
+### V.K. Defects found and fixed
+
+1. `stateColumns` and `scanState` had two columns out of order, causing Admin
+   fulfillment state reads to return `500 internal_error`; the selection and
+   scan destinations now match exactly.
+2. PostgreSQL inferred a `text` expression for the UUID confirmation
+   parameters in the aggregate update; `$8::uuid` and `$9::uuid` casts fixed
+   the `42804` failure on the `delivered` edge.
+3. The audit immutability trigger covered DELETE but not UPDATE; it now covers
+   `BEFORE UPDATE OR DELETE`, so direct history edits fail with `23514`.
+4. The shared customer cleanup passed `$1` to parameterless statements and set
+   a session GUC on one pooled connection; it now runs all cleanup in one
+   transaction with a transaction-local flag.
+5. The limited-stock integration expectation was broadened to accept the
+   existing authoritative `409 conflict` response as well as `422`.
+6. Admin CSRF can reject before authentication, so the customer-principal and
+   unauthenticated Admin mutation tests accept either `401` or `403`; both
+   prove no customer/anonymous principal reaches a mutation.
+
+### V.L. Remaining limitations and verdict
+
+- No refunds, cancellations, return shipping, courier integrations, GPS,
+  signatures, photos, international delivery, invented fees or ETA were added.
+- Mock payment settlement remains a local simulation; no live provider,
+  money movement, webhook, reconciliation or payout is implemented.
+- Race detection remains unavailable in this environment.
+- The direct `go test ./...` launcher is blocked by Application Control;
+  equivalent direct execution of the same compiled binaries passed.
+- No frontend integration was performed and no Git operation, deployment or
+  change to `D:\e-commerce` was made.
+
+**Overall: PASS — Backend Phase 12 is complete.** Formal checks:
+`go fmt`/`go vet`/`go build` **PASS**; full uncached suite **PASS** via direct
+binaries (76/76); race detection **BLOCKED** (environmental, not claimed).
+**STOP after Backend Phase 12. Do not begin frontend integration automatically.**
+
+---
+
+## W. Phase 12C implementation and completion report — 2026-11-24
+
+The business scope was corrected: AutivaShop is **not** a delivery management or
+order-tracking platform. An independent Delivery Application will own delivery
+operations and will later send verified status updates to AutivaShop. Phase 12C
+is therefore a scope-alignment and boundary-documentation pass. The verified
+Phase 12 behavior was not rebuilt or weakened.
+
+### W.A. Scope audit findings
+
+| Inspected area | Finding |
+| --- | --- |
+| `migrations/0006_fulfillment.sql` | Defines an authoritative fulfillment aggregate, append-only audit, frozen order delivery snapshot and one-time inventory consumption records. It contains no GPS, courier, driver, routing, map or ETA structure. |
+| Fulfillment state machine | Forward-only `pending → processing → ready_for_delivery → out_for_delivery → delivered`. Each edge is explicit, version-checked and audited. No skip, backward move or silent cancellation exists. |
+| Admin fulfillment endpoints | State, history and conflicts reads plus four explicit transition routes. These are order-fulfillment controls, not delivery dispatch/tracking controls. |
+| Customer progress read | One authenticated owner-only read with narrow status history. No courier, location, ETA, driver or cross-customer data is returned. |
+| Inventory consumption | Successful mock settlement writes exactly one immutable consumption record per order/product reservation; fulfillment only checks allocation and never deducts stock again. |
+| Delivery snapshot and confirmation | A frozen copy of the existing Rwanda order address plus explicit Admin manual confirmation metadata. This is order evidence, not a tracking system. |
+| Audit events | Append-only transition rows carry actor, event, version, fingerprint, idempotency key and timestamp; direct UPDATE/DELETE is blocked by trigger. |
+| Payment/fulfillment coupling | Fulfillment reads backend-authoritative payment state; mock settlement is dev/test-only and rejected in production. Payment behavior was unchanged. |
+| Tests and documentation | The 76 Phase 12 and earlier tests were retained. Existing Phase 12 documentation described local delivery metadata but did not implement delivery management. |
+
+Conclusion: no internal courier management, GPS tracking, routing, driver
+assignment, map integration, live delivery API or unsecured webhook exists.
+
+### W.B. Existing functionality retained
+
+**Required by AutivaShop**
+
+- Payment eligibility from authoritative order/payment state.
+- Fail-closed settlement modes; production rejects mock-payment fulfillment.
+- Secure processing, out-for-delivery and delivered status transitions.
+- Inventory allocation/consumption protection and no oversell guarantees.
+- Admin state/history/conflicts visibility and Admin Orders filters/counts.
+- Immutable, versioned, actor-attributed audit history.
+- CSRF/origin checks, strict auth/role separation and owner-only customer read.
+- Frozen order delivery snapshot and manual delivery confirmation metadata.
+
+**Useful for future Delivery API integration**
+
+- `order_fulfillment.version` and exact-version conflict semantics.
+- `fulfillment_transitions.idempotency_key` and `request_fingerprint`.
+- `out_for_delivery` and `delivered` event vocabulary already present in the audit allowlist.
+- `actor_type='system'` support in the audit table for a future service actor.
+- Stable `orders.id` and `orders.reference` for external mapping.
+- Owner-only customer status projection that can remain simple while an adapter translates future events.
+
+All of the above were preserved without modification.
+
+### W.C. Unnecessary functionality identified
+
+No unnecessary delivery-specific functionality was found to remove.
+
+The following are deliberately **not** present and were not added:
+
+- courier, driver, vehicle, route or dispatch management;
+- GPS coordinates, map rendering, geolocation or inferred location;
+- ETA computation, live tracking timeline or courier callbacks;
+- signature, photo or proof-of-delivery capture;
+- international delivery, invented fees or invented addresses;
+- public/unsecured webhook endpoints;
+- customer mutation routes or cross-customer delivery data;
+- live delivery application calls or assumed endpoint/auth contracts.
+
+`ready_for_delivery` and the narrow customer history remain because they are
+order-status/audit data, not tracking features. Removing them would be a
+destructive and unnecessary state-machine change.
+
+### W.D. Actual changes
+
+Phase 12C made **documentation-only** changes:
+
+- this Section W was appended to `D:\backend\README.md`;
+- no Go source file was changed;
+- no migration was added, deleted or modified;
+- no test was added, removed or relaxed;
+- no frontend file was changed;
+- no external service was contacted.
+
+Rationale: the existing implementation already satisfies the corrected scope.
+A backward-compatible simplification of the state machine was not demonstrably
+necessary, and the instructions require preserving the verified state machine,
+security and inventory guarantees.
+
+### W.E. Database integrity review
+
+- All six migrations were applied from scratch to the isolated PostgreSQL 18 database.
+- `migrations/0006_fulfillment.sql` was retained exactly in its Phase 12 form.
+- Order/payment associations, inventory consumption records, transition versions,
+  actor attribution, immutable audit rows and all foreign keys remain intact.
+- No destructive SQL, backfill rewrite, constraint relaxation or audit deletion was performed.
+- Controlled cleanup remains a test-only transaction-local mechanism; no API can erase history.
+
+### W.F. Future Delivery API contract readiness
+
+No live integration was implemented. A future adapter should be added only after
+the Delivery Application's verified contract is available. That adapter must
+normalize an external event into AutivaShop's existing authoritative transition
+model; it must not expose a new public webhook or trust unverified input.
+
+Required adapter capabilities:
+
+| Capability | Boundary requirement |
+| --- | --- |
+| Order mapping | Resolve `orderReference` or `orderId` against `orders`; never create or select an order from untrusted text alone. |
+| Authentication | Verify Delivery Application service identity/signature using the future verified contract. No endpoint or auth scheme is assumed here. |
+| Event identity | Require a stable external `eventId`; derive idempotency key and request fingerprint from the verified payload. |
+| Event types | Support only `out_for_delivery` and `delivered` status events initially, normalized to the existing internal event vocabulary. |
+| Timestamps | Accept an event timestamp only after format and clock-skew validation; store it in audit metadata. Client-supplied timestamps are never accepted by current Admin APIs. |
+| Version/conflict | Carry or resolve the expected fulfillment version; stale or out-of-order events return conflict and write no new transition. |
+| Replay/duplicates | Repeated `eventId` returns a replay result without a second audit row; a changed payload under the same key is rejected. |
+| Auditing | Append a transition with `actor_type='system'` and metadata containing external event ID, source and verification result. No customer note or Admin identity is fabricated. |
+| Authorization | A verified `delivered` event is the only non-Admin path that may mark an order delivered; no anonymous or customer request can do so. |
+| Failure handling | Unknown sources, invalid signatures, malformed events, unsupported statuses and unresolved orders fail closed with the standard error envelope. |
+
+Any new event types, external-event table or extra metadata columns must be
+introduced by a new forward-only migration after the contract is verified.
+This phase does not assume the Delivery Application's endpoint names, token
+format or event schema.
+
+### W.G. Minimal frontend status API contracts
+
+The next frontend phase should use the existing APIs only. It should render
+simple order status labels, not a tracking dashboard.
+
+| API | Frontend use | Boundary |
+| --- | --- | --- |
+| `GET /api/v1/orders/{id}/fulfillment` | Authenticated owner sees current status and narrow status history. | No GPS, courier, ETA, driver, internal note or other customer's data. No mutation capability. |
+| `GET /api/v1/admin/orders/{id}/fulfillment/state` | Admin sees authoritative status, version, settlement mode, delivery snapshot and allowed next events. | Order state only; not delivery operations. |
+| `GET /api/v1/admin/orders/{id}/fulfillment/history` | Admin sees actor-attributed immutable history. | Internal notes remain Admin-only. |
+| `GET /api/v1/admin/orders/{id}/fulfillment/conflicts` | Admin sees computed blockers before acting. | Read-only; never repairs data. |
+| `POST /api/v1/admin/orders/{id}/fulfillment/processing` | Admin-controlled local transition. | Requires Admin session, roles, Origin/CSRF, version and idempotency key. |
+| `POST /api/v1/admin/orders/{id}/fulfillment/ready-for-delivery` | Admin-controlled local transition. | Same controls. |
+| `POST /api/v1/admin/orders/{id}/fulfillment/out-for-delivery` | Admin-controlled local transition today. | Future verified Delivery Application events may also map to this internal state; no live event is exposed now. |
+| `POST /api/v1/admin/orders/{id}/fulfillment/delivered` | Admin-controlled manual confirmation today. | Future verified Delivery Application delivered event may map here via adapter; never automatic from an unauthenticated source. |
+
+Internal values remain `pending`, `processing`, `ready_for_delivery`,
+`out_for_delivery` and `delivered`. The UI may display simpler labels such as
+“Processing”, “On the way” and “Delivered” without changing database values.
+No frontend phase should invent live events, courier identities or ETAs.
+
+### W.H. Tests and regression results
+
+No new test was required because no runtime behavior changed. The full Phase 12
+suite was rerun against a freshly recreated isolated PostgreSQL 18 database.
+
+| Check | Result |
+| --- | --- |
+| Six migrations applied from scratch | **PASS** |
+| `go fmt ./...` | **PASS**, exit 0 |
+| `go vet ./...` | **PASS**, exit 0 |
+| `go build ./...` | **PASS**, exit 0 |
+| `go test ./... -count=1 -timeout 300s` with isolated `TEST_DATABASE_URL` | **PARTIAL at launcher level** — `internal/product` and all non-test packages passed; the `tests` binary could not be launched from Go's build temp directory by Application Control. No assertion failed. |
+| Direct prebuilt binaries from approved temp path | **PASS** — `internal/product` 1/1 and integration package 75/75; **76 total, 0 failures, 0 skips**. |
+| `TestPhase12FulfillmentOverRealTCP` | **PASS** on a real loopback TCP listener. |
+| Previous Phase 02/03/06/08/10/12 tests | **PASS**, all retained. |
+| `go test -race ./...` | **BLOCKED**, unchanged from Phase 12 — `-race requires cgo`; `CGO_ENABLED=0` and no `gcc` is installed. No race result is claimed. |
+
+Windows Application Control continued to block `go test`'s unsigned temporary
+executable. The same compiled test binaries were run directly from the approved
+local temp path. No policy was changed, disabled or bypassed.
+
+### W.I. Remaining integration requirements
+
+Before any future Delivery Application integration:
+
+- obtain and verify the provider's endpoint, authentication, event schema and retry contract;
+- decide whether a new forward-only migration is needed for external event metadata or new event types;
+- implement a narrow service-level adapter with service identity verification, event-ID idempotency, timestamp skew checks and version-conflict handling;
+- ensure external `delivered` events are authorized and auditable before changing an order;
+- keep Customer and Admin APIs unchanged except for straightforward status labeling;
+- obtain a working C toolchain before claiming any race-detection result;
+- do not implement live XendlyPay, WhatsApp, refunds, shipping, GPS, courier/driver management or frontend integration in this backend phase.
+
+### W.J. PASS / PARTIAL / FAIL
+
+| Area | Result |
+| --- | --- |
+| Scope alignment with revised delivery architecture | **PASS** |
+| Preservation of payment, inventory, auth, CSRF, audit and concurrency guarantees | **PASS** |
+| Database integrity / no destructive migration | **PASS** |
+| Full regression suite via approved direct binaries | **PASS** — 76/76 |
+| Direct `go test ./...` launcher in this Windows environment | **PARTIAL** — Application Control blocks the temporary binary; no test failure |
+| Race detection | **BLOCKED** — environment lacks cgo/C compiler; not claimed |
+| Frontend integration | **Not started**, as required |
+
+**Overall: PASS — Backend Phase 12C scope alignment is complete.** The only
+changes are this README report; no code, schema, test, frontend, Git or
+deployment action was taken.
+**STOP AFTER PHASE 12C. Do not begin frontend integration automatically.**

@@ -87,23 +87,42 @@ func (e *customerOrderEnv) cleanupCustomer(t *testing.T, id string) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		statements := []string{
-			`DELETE FROM payment_audit_events WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1)`,
-			`DELETE FROM payment_transitions WHERE attempt_id IN (SELECT id FROM payment_attempts WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1))`,
-			`DELETE FROM payment_events WHERE attempt_id IN (SELECT id FROM payment_attempts WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1))`,
-			`DELETE FROM payment_attempts WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1)`,
-			`DELETE FROM order_audit_events WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1)`,
-			`DELETE FROM inventory_reservations WHERE order_id IN (SELECT id FROM orders WHERE customer_id=$1)`,
-			`DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE customer_id=$1)`,
-			`DELETE FROM orders WHERE customer_id=$1`,
-			`DELETE FROM customer_audit_events WHERE customer_id=$1`,
-			`DELETE FROM customer_sessions WHERE customer_id=$1`,
-			`DELETE FROM customers WHERE id=$1`,
+		type cleanupStatement struct {
+			sql  string
+			args []any
 		}
+		withOrder := []any{id}
+		statements := []cleanupStatement{
+			{sql: `SELECT set_config('autivashop.fulfillment_cleanup','on',true)`},
+			{sql: `DELETE FROM fulfillment_transitions WHERE order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM order_fulfillment WHERE order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM inventory_consumption_events WHERE order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM payment_audit_events WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM payment_transitions WHERE attempt_id IN (SELECT id FROM payment_attempts WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1))`, args: withOrder},
+			{sql: `DELETE FROM payment_events WHERE attempt_id IN (SELECT id FROM payment_attempts WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1))`, args: withOrder},
+			{sql: `DELETE FROM payment_attempts WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM order_audit_events WHERE customer_id=$1 OR order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM inventory_reservations WHERE order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE customer_id=$1)`, args: withOrder},
+			{sql: `DELETE FROM orders WHERE customer_id=$1`, args: withOrder},
+			{sql: `DELETE FROM customer_audit_events WHERE customer_id=$1`, args: withOrder},
+			{sql: `DELETE FROM customer_sessions WHERE customer_id=$1`, args: withOrder},
+			{sql: `DELETE FROM customers WHERE id=$1`, args: withOrder},
+		}
+		tx, err := e.db.Pool().Begin(ctx)
+		if err != nil {
+			t.Errorf("customer cleanup begin failed: %v", err)
+			return
+		}
+		defer tx.Rollback(ctx)
 		for _, statement := range statements {
-			if _, err := e.db.Exec(ctx, statement, id); err != nil {
+			if _, err := tx.Exec(ctx, statement.sql, statement.args...); err != nil {
 				t.Errorf("customer cleanup failed: %v", err)
+				return
 			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Errorf("customer cleanup commit failed: %v", err)
 		}
 	})
 }

@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/url"
@@ -29,8 +30,10 @@ type Config struct {
 	CORS                CORSConfig
 	Auth                AuthConfig
 	CustomerAuth        CustomerAuthConfig
+	AdminActivation     AdminActivationConfig
 	Orders              OrdersConfig
 	Payment             PaymentConfig
+	Fulfillment         FulfillmentConfig
 	Timeouts            Timeouts
 	MaxRequestBodyBytes int64
 	LogLevel            string
@@ -63,6 +66,31 @@ type CustomerAuthConfig struct {
 	CSRFCookieName    string
 }
 
+// AdminActivationConfig configures the one-time, email-verified activation of
+// the single pre-authorized super administrator. The authorized email is a
+// compiled-in constant: it can never be changed through configuration or an API.
+// SetupIssues lists the names of missing environment variables only; it never
+// contains secret values.
+type AdminActivationConfig struct {
+	AuthorizedEmail   string
+	Enabled           bool
+	SetupIssues       []string
+	SetupAllowed      bool
+	OTPKey            []byte
+	SMTPHost          string
+	SMTPPort          int
+	SMTPUsername      string
+	SMTPPassword      string
+	SMTPFrom          string
+	SMTPTLSMode       string
+	SMTPTimeout       time.Duration
+	MaxVerifyAttempts int
+	MaxResends        int
+	ResendWindow      time.Duration
+	RequestCooldown   time.Duration
+	AuthorizationTTL  time.Duration
+}
+
 // OrdersConfig controls the finite lifetime of unpaid-order stock reservations.
 type OrdersConfig struct {
 	ReservationTTL time.Duration
@@ -82,6 +110,13 @@ type PaymentConfig struct {
 	Provider    string
 	Environment string
 	IsMock      bool
+}
+
+// FulfillmentConfig controls whether a locally simulated settlement may
+// authorize an explicitly labelled dev/test fulfillment. Production always
+// fails closed; no code path in this phase can treat mock funds as real.
+type FulfillmentConfig struct {
+	AllowSimulated bool
 }
 
 // DatabaseConfig holds non-secret connection settings. The DSN is kept out of
@@ -213,11 +248,19 @@ func Load(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	cfg.AdminActivation, err = loadAdminActivation(getenv, cfg.Environment)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg.Orders, err = loadOrders(getenv)
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.Payment, err = loadPayment(getenv, cfg.Environment)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Fulfillment, err = loadFulfillment(getenv, cfg.Environment)
 	if err != nil {
 		return Config{}, err
 	}
@@ -427,6 +470,118 @@ func loadCustomerAuth(getenv func(string) string, admin AuthConfig) (CustomerAut
 	return cfg, nil
 }
 
+// AuthorizedAdminEmail is the only address eligible for initial super_admin
+// activation. It is deliberately not configurable and has no public API.
+const AuthorizedAdminEmail = "autivatechltd@gmail.com"
+
+// loadAdminActivation is fail-closed: missing or partial email configuration
+// disables the activation endpoints instead of fabricating delivery success.
+func loadAdminActivation(getenv func(string) string, environment string) (AdminActivationConfig, error) {
+	cfg := AdminActivationConfig{
+		AuthorizedEmail:   AuthorizedAdminEmail,
+		SMTPPort:          587,
+		SMTPTLSMode:       "starttls",
+		SMTPTimeout:       10 * time.Second,
+		MaxVerifyAttempts: 5,
+		MaxResends:        3,
+		ResendWindow:      time.Hour,
+		RequestCooldown:   60 * time.Second,
+		AuthorizationTTL:  5 * time.Minute,
+	}
+	var err error
+
+	cfg.SetupAllowed, err = parseBool(getenv("AUTIVASHOP_ALLOW_ACTIVATION_SETUP"), false, "AUTIVASHOP_ALLOW_ACTIVATION_SETUP")
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+
+	issues := make([]string, 0)
+
+	rawKey := strings.TrimSpace(getenv("ADMIN_ACTIVATION_OTP_KEY"))
+	if rawKey == "" {
+		issues = append(issues, "ADMIN_ACTIVATION_OTP_KEY")
+	} else {
+		key, keyErr := base64.StdEncoding.DecodeString(rawKey)
+		if keyErr != nil || len(key) < 32 {
+			return AdminActivationConfig{}, fmt.Errorf("ADMIN_ACTIVATION_OTP_KEY must be base64-encoded key material of at least 32 bytes")
+		}
+		cfg.OTPKey = key
+	}
+
+	cfg.SMTPHost = strings.TrimSpace(getenv("ADMIN_ACTIVATION_SMTP_HOST"))
+	if cfg.SMTPHost == "" {
+		issues = append(issues, "ADMIN_ACTIVATION_SMTP_HOST")
+	} else if strings.ContainsAny(cfg.SMTPHost, " \t\r\n/") {
+		return AdminActivationConfig{}, fmt.Errorf("ADMIN_ACTIVATION_SMTP_HOST must be a host name")
+	}
+
+	cfg.SMTPPort, err = parsePort(getenv("ADMIN_ACTIVATION_SMTP_PORT"), 587, "ADMIN_ACTIVATION_SMTP_PORT")
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+	cfg.SMTPUsername = strings.TrimSpace(getenv("ADMIN_ACTIVATION_SMTP_USERNAME"))
+	cfg.SMTPPassword = getenv("ADMIN_ACTIVATION_SMTP_PASSWORD")
+	if (cfg.SMTPUsername == "") != (cfg.SMTPPassword == "") {
+		issues = append(issues, "ADMIN_ACTIVATION_SMTP_USERNAME and ADMIN_ACTIVATION_SMTP_PASSWORD must be supplied together")
+	}
+
+	cfg.SMTPFrom = strings.TrimSpace(getenv("ADMIN_ACTIVATION_SMTP_FROM"))
+	if cfg.SMTPFrom == "" {
+		issues = append(issues, "ADMIN_ACTIVATION_SMTP_FROM")
+	} else if !strings.Contains(cfg.SMTPFrom, "@") || strings.ContainsAny(cfg.SMTPFrom, "\r\n") {
+		return AdminActivationConfig{}, fmt.Errorf("ADMIN_ACTIVATION_SMTP_FROM must be a single email address")
+	}
+
+	cfg.SMTPTLSMode = strings.ToLower(strings.TrimSpace(getenv("ADMIN_ACTIVATION_SMTP_TLS")))
+	if cfg.SMTPTLSMode == "" {
+		cfg.SMTPTLSMode = "starttls"
+	}
+	switch cfg.SMTPTLSMode {
+	case "starttls", "tls":
+	case "none":
+		if environment == EnvProduction {
+			issues = append(issues, "ADMIN_ACTIVATION_SMTP_TLS must be starttls or tls in production")
+		}
+	default:
+		return AdminActivationConfig{}, fmt.Errorf("ADMIN_ACTIVATION_SMTP_TLS must be starttls, tls, or none")
+	}
+
+	cfg.SMTPTimeout, err = parseDuration(getenv("ADMIN_ACTIVATION_SMTP_TIMEOUT"), 10*time.Second, "ADMIN_ACTIVATION_SMTP_TIMEOUT")
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+	cfg.MaxVerifyAttempts, err = parseIntRange(getenv("ADMIN_ACTIVATION_MAX_VERIFY_ATTEMPTS"), 5, "ADMIN_ACTIVATION_MAX_VERIFY_ATTEMPTS", 1, 100)
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+	cfg.MaxResends, err = parseIntRange(getenv("ADMIN_ACTIVATION_MAX_RESENDS"), 3, "ADMIN_ACTIVATION_MAX_RESENDS", 1, 100)
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+	cfg.ResendWindow, err = parseDuration(getenv("ADMIN_ACTIVATION_RESEND_WINDOW"), time.Hour, "ADMIN_ACTIVATION_RESEND_WINDOW")
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+	cfg.RequestCooldown, err = parseDuration(getenv("ADMIN_ACTIVATION_REQUEST_COOLDOWN"), 60*time.Second, "ADMIN_ACTIVATION_REQUEST_COOLDOWN")
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+	if cfg.RequestCooldown > cfg.ResendWindow {
+		return AdminActivationConfig{}, fmt.Errorf("ADMIN_ACTIVATION_REQUEST_COOLDOWN must not exceed ADMIN_ACTIVATION_RESEND_WINDOW")
+	}
+	cfg.AuthorizationTTL, err = parseDuration(getenv("ADMIN_ACTIVATION_AUTH_TTL"), 5*time.Minute, "ADMIN_ACTIVATION_AUTH_TTL")
+	if err != nil {
+		return AdminActivationConfig{}, err
+	}
+	if cfg.AuthorizationTTL < time.Minute || cfg.AuthorizationTTL > 15*time.Minute {
+		return AdminActivationConfig{}, fmt.Errorf("ADMIN_ACTIVATION_AUTH_TTL must be between 1m and 15m")
+	}
+
+	cfg.SetupIssues = issues
+	cfg.Enabled = len(issues) == 0
+	return cfg, nil
+}
+
 func loadOrders(getenv func(string) string) (OrdersConfig, error) {
 	ttl, err := parseDuration(getenv("ORDER_RESERVATION_TTL"), 30*time.Minute, "ORDER_RESERVATION_TTL")
 	if err != nil {
@@ -462,6 +617,20 @@ func loadPayment(getenv func(string) string, environment string) (PaymentConfig,
 	default:
 		return PaymentConfig{}, fmt.Errorf("PAYMENT_PROVIDER must be mock or xendlypay")
 	}
+}
+
+// loadFulfillment is fail-closed in production. A simulated settlement may
+// unlock fulfillment only in development/test and is always recorded as such.
+func loadFulfillment(getenv func(string) string, environment string) (FulfillmentConfig, error) {
+	allow, err := parseBool(getenv("FULFILLMENT_ALLOW_SIMULATED"),
+		environment != EnvProduction, "FULFILLMENT_ALLOW_SIMULATED")
+	if err != nil {
+		return FulfillmentConfig{}, err
+	}
+	if environment == EnvProduction && allow {
+		return FulfillmentConfig{}, fmt.Errorf("FULFILLMENT_ALLOW_SIMULATED must be false in production")
+	}
+	return FulfillmentConfig{AllowSimulated: allow}, nil
 }
 
 func parseIntRange(raw string, fallback int, name string, min, max int) (int, error) {

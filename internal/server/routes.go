@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"autivashop/backend/internal/auth"
+	"autivashop/backend/internal/fulfillment"
 	"autivashop/backend/internal/middleware"
 )
 
@@ -100,6 +101,7 @@ func (s *Server) registerPayments(mux *http.ServeMux) {
 				),
 			).ServeHTTP)
 		}
+		s.registerAdminReports(mux, protect)
 		mux.HandleFunc("GET /api/v1/admin/payments", protect(h.adminList))
 		mux.HandleFunc("GET /api/v1/admin/payments/summary", protect(h.adminSummary))
 		mux.HandleFunc("GET /api/v1/admin/payments/{attemptId}", protect(h.adminGet))
@@ -111,4 +113,100 @@ func (s *Server) registerPayments(mux *http.ServeMux) {
 		}
 		methodFallback(mux, "/api/v1/admin/payments/{attemptId}", "GET, HEAD")
 	}
+}
+
+// registerCustomerFulfillment exposes only an owner-scoped progress read. No
+// customer principal can reach an Admin mutation route.
+func (s *Server) registerCustomerFulfillment(mux *http.ServeMux) {
+	ch := &customerHandlers{
+		svc:     s.customerService,
+		cfg:     s.cfg,
+		cookies: auth.NewCustomerCookieConfig(s.cfg),
+		logger:  s.logger,
+	}
+	h := &customerFulfillmentHandlers{svc: s.fulfillmentService}
+	protect := func(f http.HandlerFunc) http.HandlerFunc {
+		return ch.requireAuth(middleware.RequireCustomer(f).ServeHTTP)
+	}
+	path := "/api/v1/orders/{id}/fulfillment"
+	mux.HandleFunc("GET "+path, protect(h.get))
+	methodFallback(mux, path, "GET, HEAD")
+}
+
+// registerAdminFulfillment exposes explicit transition endpoints. There is no
+// generic status-update endpoint; every allowed edge has its own route.
+func (s *Server) registerAdminFulfillment(mux *http.ServeMux) {
+	ah := &adminHandlers{
+		svc:     s.adminService,
+		cfg:     s.cfg,
+		cookies: auth.NewCookieConfig(s.cfg.Auth),
+		logger:  s.logger,
+	}
+	protect := func(f http.HandlerFunc) http.HandlerFunc {
+		return ah.requireAuth(middleware.RequireAuthenticated(
+			middleware.RequireActiveAccount(
+				middleware.RequireRoles("admin", "super_admin")(f),
+			),
+		).ServeHTTP)
+	}
+	h := &fulfillmentHandlers{svc: s.fulfillmentService, logger: s.logger}
+	base := "/api/v1/admin/orders/{id}/fulfillment"
+
+	for path, handler := range map[string]http.HandlerFunc{
+		base + "/state":     h.getState,
+		base + "/history":   h.getHistory,
+		base + "/conflicts": h.getConflicts,
+	} {
+		mux.HandleFunc("GET "+path, protect(handler))
+		methodFallback(mux, path, "GET, HEAD")
+	}
+	transitions := map[string]string{
+		"/processing":         fulfillment.EventStartProcessing,
+		"/ready-for-delivery": fulfillment.EventMarkReady,
+		"/out-for-delivery":   fulfillment.EventDispatch,
+		"/delivered":          fulfillment.EventConfirmDelivery,
+	}
+	for path, event := range transitions {
+		mux.HandleFunc("POST "+base+path, protect(h.transition(event)))
+		methodFallback(mux, base+path, "POST")
+	}
+}
+
+// registerAdminReports adds read-only order and dashboard endpoints. The
+// service is optional so a server without database-backed reports exposes no
+// partial surface. Authorization is always inherited from the caller.
+func (s *Server) registerAdminReports(mux *http.ServeMux, protect func(http.HandlerFunc) http.HandlerFunc) {
+	if s.adminReportService == nil {
+		return
+	}
+	h := &adminReportHandlers{svc: s.adminReportService, logger: s.logger}
+
+	mux.HandleFunc("GET /api/v1/admin/orders", protect(h.listOrders))
+	methodFallback(mux, "/api/v1/admin/orders", "GET, HEAD")
+
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}", protect(h.getOrder))
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}/items", protect(h.getItems))
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}/contact", protect(h.getContact))
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}/delivery", protect(h.getDelivery))
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}/payment", protect(h.getPayment))
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}/fulfillment", protect(h.getFulfillment))
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}/payment-attempts", protect(h.getAttempts))
+	mux.HandleFunc("GET /api/v1/admin/orders/{id}/payment-attempt-summary", protect(h.getAttemptSummary))
+	for _, path := range []string{
+		"/api/v1/admin/orders/{id}",
+		"/api/v1/admin/orders/{id}/items",
+		"/api/v1/admin/orders/{id}/contact",
+		"/api/v1/admin/orders/{id}/delivery",
+		"/api/v1/admin/orders/{id}/payment",
+		"/api/v1/admin/orders/{id}/fulfillment",
+		"/api/v1/admin/orders/{id}/payment-attempts",
+		"/api/v1/admin/orders/{id}/payment-attempt-summary",
+	} {
+		methodFallback(mux, path, "GET, HEAD")
+	}
+
+	mux.HandleFunc("GET /api/v1/admin/dashboard", protect(h.dashboard))
+	mux.HandleFunc("GET /api/v1/admin/dashboard/summary", protect(h.dashboard))
+	methodFallback(mux, "/api/v1/admin/dashboard", "GET, HEAD")
+	methodFallback(mux, "/api/v1/admin/dashboard/summary", "GET, HEAD")
 }
